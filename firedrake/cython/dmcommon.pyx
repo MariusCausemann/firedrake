@@ -530,6 +530,7 @@ def quadrilateral_closure_ordering(PETSc.DM plex,
         PetscInt g_vertices[4]
         PetscInt vertices[4]
         PetscInt facets[4]
+        const PetscInt *cell_cone = NULL
         int reverse
         np.ndarray[PetscInt, ndim=2, mode="c"] cell_closure
 
@@ -572,7 +573,6 @@ def quadrilateral_closure_ordering(PETSc.DM plex,
                 fi += 1
 
         # The first vertex is given by the entry in cell_orientations.
-        # The second vertex is always the one with the smaller global number.
         start_v = cell_orientations[cell]
 
         # Based on the cell orientation, we reorder the vertices and facets
@@ -582,7 +582,17 @@ def quadrilateral_closure_ordering(PETSc.DM plex,
             off += 1
         assert off < 4
 
-        if g_vertices[(off + 1) % 4] < g_vertices[(off + 3) % 4]:
+        # The second vertex is chosen so that Cone(c)[0] would either be
+        # the first facet or the second facet in the FInAT ordering.
+        # This process reduces the number of possible orientations of the
+        # plex-intrinsic cell relative to the FInAT reference cell by a
+        # factor of 2. The quad cell being written as the tensor product
+        # of two intervals, one can represent the remaining 4 (= 2x2)
+        # orientations by integers in [0, 4).
+        # Our using Cone(c)[0] here is essential to keep track of the
+        # correct entity permutations during the save/load cycles.
+        CHKERR(DMPlexGetCone(plex.dm, c, &cell_cone))
+        if cell_cone[0] in (c_facets[off], c_facets[(off + 2) % 4]):
             for i in range(off, 4):
                 vertices[i - off] = c_vertices[i]
                 facets[i - off] = c_facets[i]
@@ -2298,16 +2308,17 @@ def orientations_facet2cell(
                 dst_orient[i] = (cone_orient[i] < 0) ^ facet_orientations[cone[i] - fStart]
 
             # We select vertex X (figure above) as starting vertex.
-            # Both traversal order (CCW or CW) is fine. We choose the traversal
-            # where the second vertex has the smaller global number.
+            # We choose the traversal where the X and the second vertex
+            # would make either:
+            # - the cone of the first facet, or
+            # - the cone of the opposing facet of the first facet
+            # where the facet ordering is given by the plex cell cone.
             #
-            # The other traversal other would be an equally good choice,
-            # however, for cells in the halo, the same choice must be made in
-            # each MPI process which sees that cell.
+            # This ensures that cells in the halo are consistently
+            # oriented across MPI processes.
             #
-            # To ensure this, we only calculate cell orientations for the
-            # locally owned cells, and later exchange these values on the
-            # halo cells.
+            # We only calculate cell orientations for the locally owned
+            # cells, and later exchange these values on the halo cells.
             if dst_orient[2] and dst_orient[3]:
                 off = 0
             elif dst_orient[3] and dst_orient[0]:
