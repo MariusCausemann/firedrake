@@ -10,6 +10,7 @@ import firedrake.utils as utils
 
 import ufl
 
+from torch.nn.utils import vector_to_parameters, parameters_to_vector 
 
 class Backend:
     @utils.cached_property
@@ -286,11 +287,16 @@ class PointwiseOperatorBlock(Block, Backend):
     def __init__(self, point_op, *args, **kwargs):
         super(PointwiseOperatorBlock, self).__init__()
         self.point_op = point_op
+        self.model_params = self.point_op.model_parameters
+        self.original_params = parameters_to_vector(self.model_params.model.parameters())
         for c in self.point_op.ufl_operands:
             coeff_c = ufl.algorithms.extract_coefficients(c)
             for ci in coeff_c:
                 self.add_dependency(ci, no_duplicates=True)
         self.add_dependency(self.point_op, no_duplicates=True)
+        self.add_dependency(self.model_params, no_duplicates=True)
+
+        
 
     @no_annotations
     def evaluate_adj(self, markings=False):
@@ -305,8 +311,8 @@ class PointwiseOperatorBlock(Block, Backend):
 
         """
         # If the ExternalOperator isn't a neural net we can go with the normal procedure
-        if not isinstance(self.point_op, self.backend.PointnetOperator):
-            return Block.evaluate_adj(self, markings=markings)
+        #if not isinstance(self.point_op, self.backend.PointnetOperator):
+        #    return Block.evaluate_adj(self, markings=markings)
 
         outputs = self.get_outputs()
         adj_inputs = []
@@ -325,39 +331,47 @@ class PointwiseOperatorBlock(Block, Backend):
         relevant_dependencies = [(i, bv) for i, bv in enumerate(deps) if bv.marked_in_path or not markings]
 
         # If the ExternalOperator is a neural network dependencies are: (inputs, model_parameters, N)
-        relevant_model_dependencies = [(i, bv) for i, bv in relevant_dependencies
-                                       if bv.output in self.point_op.operator_params()]
+        #relevant_model_dependencies = [(i, bv) for i, bv in relevant_dependencies
+        #                               if bv.output in self.point_op.operator_params()]
+        relevant_model_dependencies =  [(i, bv) for i, bv in relevant_dependencies
+                                       if isinstance(bv.output, type(self.point_op.model_parameters))]
         relevant_dependencies = list(set(relevant_dependencies) - set(relevant_model_dependencies))
-
-        if len(relevant_dependencies) <= 0:
-            return
+        
 
         prepared = self.prepare_evaluate_adj(inputs, adj_inputs, relevant_dependencies)
 
-        # -- Evaluate adjoint component for the inputs --
+        if len(relevant_dependencies) > 0:
 
-        for idx, dep in relevant_dependencies:
-            adj_output = self.evaluate_adj_component(inputs,
-                                                     adj_inputs,
-                                                     dep,
-                                                     idx,
-                                                     prepared)
-            if adj_output is not None:
-                dep.add_adj_output(adj_output)
+            print(" -- Evaluate adjoint component for the inputs -- ")
+            
+            for idx, dep in relevant_dependencies:
+                adj_output = self.evaluate_adj_component(inputs,
+                                                        adj_inputs,
+                                                        dep,
+                                                        idx,
+                                                        prepared)
+                if adj_output is not None:
+                    dep.add_adj_output(adj_output)
 
         if len(relevant_model_dependencies) <= 0:
             return
 
-        # -- Evaluate adjoint for the model parameters --
+        print(" -- Evaluate adjoint component for the model parameters -- ")
 
         N = prepared
         # Register the parameters we are backpropagating for
-        params_idx, params_rep = zip(*tuple((i-len(self.point_op.operator_inputs()), bv.saved_output)
-                                            for i, bv in relevant_model_dependencies))
+        #params_idx, params_rep = zip(*tuple((i-len(self.point_op.operator_inputs()), bv.saved_output)
+        #                                    for i, bv in relevant_model_dependencies))
         # Register parameter version
-        N._params_version['version'] = sum(w.dat.dat_version for w in params_rep)
+        #N._params_version['version'] = sum(w.dat.dat_version for w in params_rep)
 
-        adj_outputs = N.evaluate_backprop(adj_inputs[0], params_idx, params_rep)
+        #adj_outputs = N.evaluate_backprop(adj_inputs[0], params_idx, params_rep)
+        # set new weights for pytorch model
+
+        #new_weights = parameters_to_vector( relevant_model_dependencies[-1][1].output.model.parameters() )
+        #vector_to_parameters(new_weights, self.point_op.model.parameters())
+        adj_outputs = N.evaluate_backprop(adj_inputs[0])
+
         for dep, adj_output in zip(relevant_model_dependencies, adj_outputs):
             if adj_output is not None:
                 dep[1].add_adj_output(adj_output)
@@ -367,7 +381,8 @@ class PointwiseOperatorBlock(Block, Backend):
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, N=None):
         if self.point_op.get_coefficient() == block_variable.output:
-            # We are not able to calculate derivatives wrt initial guess.
+            #print("We are not able to calculate derivatives wrt initial guess.")
+            #from IPython import embed; embed()
             return None
 
         q_rep = block_variable.saved_output
@@ -385,6 +400,11 @@ class PointwiseOperatorBlock(Block, Backend):
         return replace_coeffs
 
     def prepare_recompute_component(self, inputs, relevant_outputs):
+        for inp in inputs:
+            if isinstance(inp, type(self.point_op.model_parameters)):
+                print("updating parameters")
+                new_vec = parameters_to_vector(inp.model.parameters())
+                vector_to_parameters(new_vec, self.point_op.model.parameters())
         return ufl.replace(self.point_op, self._replace_map())
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
@@ -393,18 +413,16 @@ class PointwiseOperatorBlock(Block, Backend):
         return q.evaluate()
 
 
+
 class InterpolateBlock(Block, Backend):
     r"""
     Annotates an interpolator.
-
     Consider the block as f with 1 forward model output ``v``, and inputs ``u`` and ``g``
     (there can, in principle, be any number of outputs).
     The adjoint input is ``vhat`` (``uhat`` and ``ghat`` are adjoints to ``u`` and ``v``
     respectively and are shown for completeness). The downstream block is ``J``
     which has input ``v``.
-
     ::
-
          _             _
         |J|--<--v--<--|f|--<--u--<--...
          ¯      |      ¯      |
@@ -413,24 +431,17 @@ class InterpolateBlock(Block, Backend):
                         ---<--g--<--...
                               |
                              ghat
-
     (Arrows indicate forward model direction)
-
     ::
-
         J : V ⟶ R i.e. J(v) ∈ R ∀ v ∈ V
-
     Interpolation can operate on an expression which may not be linear in its
     arguments.
-
     ::
-
         f : W × G ⟶ V i.e. f(u, g) ∈ V ∀ u ∈ W and g ∈ G.
         f = I ∘ expr
         I :   X ⟶ V i.e. I(;x) ∈ V ∀ x ∈ X.
                           X is infinite dimensional.
         expr: W × G ⟶ X i.e. expr(u, g) ∈ X ∀ u ∈ W and g ∈ G.
-
     Arguments after a semicolon are linear (i.e. operation I is linear)
     """
     def __init__(self, interpolator, *functions, **kwargs):
@@ -470,45 +481,30 @@ class InterpolateBlock(Block, Backend):
         r"""
         Denote ``d_u[A]`` as the gateaux derivative in the ``u`` direction.
         Arguments after a semicolon are linear.
-
         This calculates
-
         ::
-
             uhat = vhat ⋅ d_u[f](u, g; ⋅) (for inputs[idx] ∈ W)
             or
             ghat = vhat ⋅ d_g[f](u, g; ⋅) (for inputs[idx] ∈ G)
-
         where ``inputs[idx]`` specifies the derivative direction, ``vhat`` is
         ``adj_inputs[0]`` (since we assume only one block output)
         and ``⋅`` denotes an unspecified operand of ``u'`` (for
         ``inputs[idx]`` ∈ ``W``) or ``g'`` (for ``inputs[idx]`` ∈ ``G``) size (``vhat`` left
         multiplies the derivative).
-
         ::
-
             f = I ∘ expr : W × G ⟶ V
                            i.e. I(expr|_{u, g}) ∈ V ∀ u ∈ W, g ∈ G.
-
         Since ``I`` is linear we get that
-
         ::
-
             d_u[I ∘ expr](u, g; u') = I ∘ d_u[expr](u|_u, g|_g; u')
             d_g[I ∘ expr](u, g; g') = I ∘ d_u[expr](u|_u, g|_g; g').
-
         In tensor notation
-
         ::
-
             uhat_q^T = vhat_p^T I([dexpr/du|_u]_q)_p
             or
             ghat_q^T = vhat_p^T I([dexpr/dg|_u]_q)_p
-
         the output is then
-
         ::
-
             uhat_q = I^T([dexpr/du|_u]_q)_p vhat_p
             or
             ghat_q = I^T([dexpr/dg|_u]_q)_p vhat_p.
@@ -525,34 +521,21 @@ class InterpolateBlock(Block, Backend):
         r"""
         Denote ``d_u[A]`` as the gateaux derivative in the ``u`` direction.
         Arguments after a semicolon are linear.
-
         For a block with two inputs this calculates
-
         ::
-
             v' = d_u[f](u, g; u') + d_g[f](u, g; g')
-
         where ``u' = tlm_inputs[0]`` and ``g = tlm_inputs[1]``.
-
         ::
-
             f = I ∘ expr : W × G ⟶ V
                            i.e. I(expr|_{u, g}) ∈ V ∀ u ∈ W, g ∈ G.
-
         Since ``I`` is linear we get that
-
         ::
-
             d_u[I ∘ expr](u, g; u') = I ∘ d_u[expr](u|_u, g|_g; u')
             d_g[I ∘ expr](u, g; g') = I ∘ d_u[expr](u|_u, g|_g; g').
-
         In tensor notation the output is then
-
         ::
-
             v'_l = I([dexpr/du|_{u,g}]_k u'_k)_l + I([dexpr/du|_{u,g}]_k g'_k)_l
                  = I([dexpr/du|_{u,g}]_k u'_k + [dexpr/du|_{u,g}]_k g'_k)_l
-
         since ``I`` is linear.
         """
         dJdm = 0.
@@ -573,23 +556,18 @@ class InterpolateBlock(Block, Backend):
         r"""
         Denote ``d_u[A]`` as the gateaux derivative in the ``u`` direction.
         Arguments after a semicolon are linear.
-
         hessian_input is ``d_v[d_v[J]](v; v', ⋅)`` where the direction ``⋅`` is left
         unspecified so it can be operated upon.
-
         .. warning::
             NOTE: This comment describes the implementation of 1 block input ``u``.
             (e.g. interpolating from an expression with 1 coefficient).
             Explaining how this works for multiple block inputs (e.g. ``u`` and ``g``) is
             currently too complicated for the author to do succinctly!
-
         This function needs to output ``d_u[d_u[J ∘ f]](u; u', ⋅)`` where
         the direction ``⋅`` will be specified in another function and
         multiplied on the right with the output of this function.
         We will calculate this using the chain rule.
-
         ::
-
             J : V ⟶ R i.e. J(v) ∈ R ∀ v ∈ V
             f = I ∘ expr : W ⟶ V
             J ∘ f : W ⟶ R i.e. J(f|u) ∈ R ∀ u ∈ V.
@@ -597,31 +575,21 @@ class InterpolateBlock(Block, Backend):
             d_u[d_u[J ∘ f]] : W × W × W ⟶ R i.e. d_u[d_u[J ∘ f]](u; u', u'')
             d_v[J] : V × V ⟶ R i.e. d_v[J](v; v')
             d_v[d_v[J]] : V × V × V ⟶ R i.e. d_v[d_v[J]](v; v', v'')
-
         Chain rule:
-
         ::
-
             d_u[J ∘ f](u; u') = d_v[J](v = f|u; v' = d_u[f](u; u'))
-
         Multivariable chain rule:
-
         ::
-
             d_u[d_u[J ∘ f]](u; u', u'') =
             d_v[d_v[J]](v = f|u; v' = d_u[f](u; u'), v'' = d_u[f](u; u''))
             + d_v'[d_v[J]](v = f|u; v' = d_u[f](u; u'), v'' = d_u[d_u[f]](u; u', u''))
             = d_v[d_v[J]](v = f|u; v' = d_u[f](u; u'), v''=d_u[f](u; u''))
             + d_v[J](v = f|u; v' = v'' = d_u[d_u[f]](u; u', u''))
-
         since ``d_v[d_v[J]]`` is linear in ``v'`` so differentiating wrt to it leaves
         its coefficient, the bare d_v[J] operator which acts on the ``v''`` term
         that remains.
-
         The ``d_u[d_u[f]](u; u', u'')`` term can be simplified further:
-
         ::
-
             f = I ∘ expr : W ⟶ V i.e. I(expr|u) ∈ V ∀ u ∈ W
             d_u[I ∘ expr] : W × W ⟶ V i.e. d_u[I ∘ expr](u; u')
             d_u[d_u[I ∘ expr]] : W × W × W ⟶ V i.e. d_u[I ∘ expr](u; u', u'')
@@ -629,33 +597,21 @@ class InterpolateBlock(Block, Backend):
             d_x[d_x[I]] : X × X × X ⟶ V i.e. d_x[d_x[I]](x; x', x'')
             d_u[expr] : W × W ⟶ X i.e. d_u[expr](u; u')
             d_u[d_u[expr]] : W × W × W ⟶ X i.e. d_u[d_u[expr]](u; u', u'')
-
         Since ``I`` is linear we get that
-
         ::
-
             d_u[d_u[I ∘ expr]](u; u', u'') = I ∘ d_u[d_u[expr]](u; u', u'').
-
         So our full hessian is:
-
         ::
-
             d_u[d_u[J ∘ f]](u; u', u'')
             = d_v[d_v[J]](v = f|u; v' = d_u[f](u; u'), v''=d_u[f](u; u''))
             + d_v[J](v = f|u; v' = v'' = d_u[d_u[f]](u; u', u''))
-
         In tensor notation
-
         ::
-
             [d^2[J ∘ f]/du^2|_u]_{lk} u'_k u''_k =
             [d^2J/dv^2|_{v=f|_u}]_{ij} [df/du|_u]_{jk} u'_k [df/du|_u]_{il} u''_l
             + [dJ/dv|_{v=f_u}]_i I([d^2expr/du^2|_u]_{lk} u'_k)_i u''_l
-
         In the first term:
-
         ::
-
             [df/du|_u]_{jk} u'_k = v'_j
             => [d^2J/dv^2|_{v=f|_u}]_{ij} [df/du|_u]_{jk} u'_k
             = [d^2J/dv^2|_{v=f|_u}]_{ij} v'_j
@@ -663,10 +619,8 @@ class InterpolateBlock(Block, Backend):
             => [d^2J/dv^2|_{v=f|_u}]_{ij} [df/du|_u]_{jk} u'_k [df/du|_u]_{il}
             = hessian_input_i [df/du|_u]_{il}
             = self.evaluate_adj_component(inputs, hessian_inputs, ...)_l
-
         In the second term we calculate everything explicitly though note
         ``[dJ/dv|_{v=f_u}]_i = adj_inputs[0]_i``
-
         Also, the second term is 0 if ``expr`` is linear.
         """
 
@@ -706,19 +660,15 @@ class InterpolateBlock(Block, Backend):
 class SupermeshProjectBlock(Block, Backend):
     r"""
     Annotates supermesh projection.
-
     Suppose we have a source space, :math:`V_A`, and a target space, :math:`V_B`.
     Projecting a source from :math:`V_A` to :math:`V_B` amounts to solving the
     linear system
-
  .. math::
         M_B * v_B = M_{AB} * v_A,
-
     where :math:`M_B` is the mass matrix on :math:`V_B`, :math:`M_{AB}` is the
     mixed mass matrix for :math:`V_A` and :math:`V_B` and :math:`v_A` and
     :math:`v_B` are vector representations of the source and target
     :class:`.Function`s.
-
     This can be broken into two steps:
       Step 1. form RHS, multiplying the source with the mixed mass matrix;
       Step 2. solve linear system.
@@ -779,7 +729,6 @@ class SupermeshProjectBlock(Block, Backend):
         Recall that the forward propagation can be broken down as
           Step 1. multiply :math:`w := M_{AB} * v_A`;
           Step 2. solve :math:`M_B * v_B = w`.
-
         For a seed vector :math:`v_B^{seed}` from the target space, the adjoint is given by
           Adjoint of step 2. solve :math:`M_B^T * w = v_B^{seed}` for `w`;
           Adjoint of step 1. multiply :math:`v_A^{adj} := M_{AB}^T * w`.
