@@ -57,3 +57,14 @@ class PytorchModelParameters(OverloadedType):
     def _ad_copy(self):
         return PytorchModelParameters(copy.deepcopy(self.model))
 
+    @staticmethod
+    def _ad_to_list(m):
+        return parameters_to_vector(m.model.parameters())
+
+
+    @staticmethod
+    def _ad_assign_numpy(dst, src, offset):
+        vector_to_parameters(torch.tensor(src[offset:offset + dst.n_params]), dst.model.parameters())
+        return dst, offset + dst.n_params
+
+
