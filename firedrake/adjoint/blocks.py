@@ -342,7 +342,7 @@ class PointwiseOperatorBlock(Block, Backend):
 
         if len(relevant_dependencies) > 0:
 
-            print(" -- Evaluate adjoint component for the inputs -- ")
+            #print(" -- Evaluate adjoint component for the inputs -- ")
             
             for idx, dep in relevant_dependencies:
                 adj_output = self.evaluate_adj_component(inputs,
@@ -356,7 +356,7 @@ class PointwiseOperatorBlock(Block, Backend):
         if len(relevant_model_dependencies) <= 0:
             return
 
-        print(" -- Evaluate adjoint component for the model parameters -- ")
+        #print(" -- Evaluate adjoint component for the model parameters -- ")
 
         N = prepared
         # Register the parameters we are backpropagating for
@@ -402,7 +402,6 @@ class PointwiseOperatorBlock(Block, Backend):
     def prepare_recompute_component(self, inputs, relevant_outputs):
         for inp in inputs:
             if isinstance(inp, type(self.point_op.model_parameters)):
-                print("updating parameters")
                 new_vec = parameters_to_vector(inp.model.parameters())
                 vector_to_parameters(new_vec, self.point_op.model.parameters())
         return ufl.replace(self.point_op, self._replace_map())
