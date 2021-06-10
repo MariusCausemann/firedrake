@@ -53,10 +53,17 @@ class PytorchOperator(AbstractExternalOperator):
     def _evaluate_jacobian(self, N, x, **kwargs):
 
         jac, = torch.autograd.grad(outputs=N, inputs=x,
-                                  grad_outputs=torch.ones_like(N),
-                                  retain_graph=True)
+                                   grad_outputs=torch.ones_like(N),
+                                   retain_graph=True)
 
         return jac
+
+    def _default_operands_to_input(self, ops):
+        inputs = torch.tensor([op.dat.data_ro for op in ops], requires_grad=True, dtype=torch.float64).T
+        return inputs
+
+    def _default_output_to_func(self, output):
+        return output.squeeze(-1).detach().numpy()
    
     def _evaluate(self, model_tape=False):
         """
@@ -72,7 +79,7 @@ class PytorchOperator(AbstractExternalOperator):
         space = self.ufl_function_space()
         ops = tuple(Function(space).interpolate(op) for op in self.operator_inputs())
 
-        torch_op = torch.tensor([op.dat.data_ro for op in ops], requires_grad=True, dtype=torch.float64).T
+        torch_op = self._default_operands_to_input(ops)
         # Vectorized forward pass
         val = model(torch_op)
 
@@ -84,9 +91,8 @@ class PytorchOperator(AbstractExternalOperator):
         if model_tape:
             return val
 
-        res = val.squeeze(-1).detach().numpy()
         result = Function(space)
-        result.dat.data[:] = res
+        result.dat.data[:] = self._default_output_to_func(val)
 
         # Explictly set the train mode does matter for
         # networks having different behaviours for training/evaluating (e.g. Dropout)
