@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import vector_to_parameters, parameters_to_vector 
 import copy
+import pytest
 
 torch.manual_seed(20)
 
@@ -24,30 +25,29 @@ class MLP(nn.Module):
     return self.layers(x)
 
 
-mesh = UnitSquareMesh(4,4)
-V1 = FunctionSpace(mesh, "CG", 1)
-x, y = SpatialCoordinate(mesh)
-w = TestFunction(V1)
-f = Function(V1, name="f").interpolate(cos(x)*sin(y))
-u = Function(V1, name="u")
-mlp = MLP()
-mlp.double()
+def test_pytorch_operator():
+  mesh = UnitSquareMesh(4,4)
+  V1 = FunctionSpace(mesh, "CG", 1)
+  x, y = SpatialCoordinate(mesh)
+  w = TestFunction(V1)
+  f = Function(V1, name="f").interpolate(cos(x)*sin(y))
+  u = Function(V1, name="u")
+  mlp = MLP()
+  net = PytorchOperator(u, function_space=V1, operator_data={"model":mlp})
 
-net = PytorchOperator(u, function_space=V1, operator_data={"model":mlp})
+  F = inner(grad(w), 10*net*grad(u))*dx + inner(u, w)*dx - inner(f, w)*dx
+  solve(F == 0, u)
 
-F = inner(grad(w), 10*net*grad(u))*dx + inner(u, w)*dx - inner(f, w)*dx
-solve(F == 0, u)
+  loss = assemble(u**2*dx)
+  print(loss)
+  weights = net.model_parameters
+  J_hat = ReducedFunctional(loss, Control(weights))
+  d = J_hat.derivative()
 
-loss = assemble(u**2*dx)
-print(loss)
-weights = net.model_parameters
-J_hat = ReducedFunctional(loss, Control(weights))
-d = J_hat.derivative()
-
-mlp_copy = copy.deepcopy(mlp)
-h = torch.ones_like(parameters_to_vector(mlp.parameters()))* 1e-3
-vector_to_parameters(h, mlp_copy.parameters())
-h = PytorchModelParameters(mlp_copy)
-#get_working_tape().visualise(output="tape.dot")
-conv_rate = taylor_test(J_hat, weights._ad_copy(), h)
-assert 1.9 < conv_rate
+  mlp_copy = copy.deepcopy(mlp)
+  h = torch.ones_like(parameters_to_vector(mlp.parameters()))* 1e-3
+  vector_to_parameters(h, mlp_copy.parameters())
+  h = PytorchModelParameters(mlp_copy)
+  #get_working_tape().visualise(output="tape.dot")
+  conv_rate = taylor_test(J_hat, weights._ad_copy(), h)
+  assert 1.9 < conv_rate
