@@ -33,6 +33,7 @@ class PytorchOperator(AbstractExternalOperator):
         """
 
         self.model = operator_data["model"]
+        self.model.double()
         self.model_parameters = PytorchModelParameters(self.model)
 
         AbstractExternalOperator.__init__(self, *operands, function_space=function_space,
@@ -74,11 +75,9 @@ class PytorchOperator(AbstractExternalOperator):
         torch_op = torch.tensor([op.dat.data_ro for op in ops], requires_grad=True, dtype=torch.float64).T
         # Vectorized forward pass
         val = model(torch_op)
-        #print("evaluating the model...")
 
         # Compute the jacobian
         if self.derivatives != (0,)*len(self.ufl_operands):
-            print("evaluate jac")
             val = self._evaluate_jacobian(val, torch_op)
 
         # We return a list instead of assigning to keep track of the PyTorch tape contained in the torch variables
@@ -103,3 +102,27 @@ class PytorchOperator(AbstractExternalOperator):
                                      retain_graph=True)
         grad_W = parameters_to_vector(grad_W)
         return [grad_W]
+
+
+def neuralnet(model, function_space, inputs_format=0):
+
+    torch_module = type(None)
+    tensorflow_module = type(None)
+
+    # Checks
+    try:
+        import torch
+        torch_module = torch.nn.modules.module.Module
+    except ImportError:
+        pass
+    if inputs_format not in (0, 1):
+        raise ValueError('Expecting inputs_format to be 0 or 1')
+
+    if isinstance(model, torch_module):
+        operator_data = {'framework': 'PyTorch', 'model': model, 'inputs_format': inputs_format}
+        return partial(PytorchOperator, function_space=function_space, operator_data=operator_data)
+    elif isinstance(model, tensorflow_module):
+        operator_data = {'framework': 'TensorFlow', 'model': model, 'inputs_format': inputs_format}
+        return partial(TensorFlowOperator, function_space=function_space, operator_data=operator_data)
+    else:
+        error("Expecting one of the following library : PyTorch, TensorFlow (or Keras) and that the library has been installed")
